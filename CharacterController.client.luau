@@ -464,7 +464,9 @@ end
 ]]
 function CharacterController:Destroy(): ()
 	for _, connection in pairs(self.connections) do
-		connection:Disconnect()
+		if connection then
+			connection:Disconnect()
+		end
 	end
 	
 	table.clear(self.connections)
