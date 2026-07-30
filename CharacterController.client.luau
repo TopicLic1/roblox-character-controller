@@ -464,7 +464,7 @@ end
 ]]
 function CharacterController:Destroy(): ()
 	self:StopAllAnimations()
-	
+
 	for _, connection in pairs(self.connections) do
 		if connection then
 			connection:Disconnect()
@@ -474,6 +474,7 @@ function CharacterController:Destroy(): ()
 	table.clear(self.connections)
 	table.clear(self.activeKeys)
 	table.clear(self.defaultKeybinds)
+	table.clear(self.loadedAnimations)
 	
 	setmetatable(self, nil)
 end
