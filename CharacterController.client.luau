@@ -463,6 +463,8 @@ end
 	clears local state tables upon character despawn or death to prevent memory leaks
 ]]
 function CharacterController:Destroy(): ()
+	self:StopAllAnimations()
+	
 	for _, connection in pairs(self.connections) do
 		if connection then
 			connection:Disconnect()
