@@ -1,6 +1,10 @@
 -- Connected Discord-GitHub Discord: inactiv Roblox: TopicLic1
 --!strict
 
+--[[
+	Wraps per-character state in an OOP class so everything can be
+	torn down deterministically via :Destroy() on every respawn
+]]
 type Keybinds = { [string]: string }
 type ActiveKeys = { [string]: boolean }
 type LoadedAnimations = { [string]: AnimationTrack | { [string]: AnimationTrack } }
@@ -49,6 +53,8 @@ function CharacterController.New(character: Model): CharacterController
 	local self = setmetatable({}, CharacterController)
 	
 	self.character = character
+
+	-- Uses WaitForChild since character rigs can stream in asynchronously
 	self.humanoid = character:WaitForChild("Humanoid") :: Humanoid
 	self.humanoidRootPart = character:WaitForChild("HumanoidRootPart") :: BasePart
 	self.animator = self.humanoid:WaitForChild("Animator") :: Animator
@@ -75,6 +81,10 @@ function CharacterController.New(character: Model): CharacterController
 	-- For mobile devices autoRun is enabled by default for better user convenience
 	self.autoRun = userInputService.TouchEnabled and not userInputService.KeyboardEnabled
 	
+	--[[
+		Starts state as nil instead of "Idle" so the first Update call always plays
+		an animation instead of being skipped by the diff check
+	]]
 	self.state = nil
 	self.blocking = false
 	
@@ -91,6 +101,10 @@ function CharacterController.New(character: Model): CharacterController
 	return self
 end
 
+--[[
+	Load animations before binding events so no callback can fire against
+	animation state that hasn't been loaded yet
+]]
 function CharacterController:Init(): ()
 	self:InitAnimations()
 	self:InitConnections()
@@ -99,6 +113,8 @@ end
 --[[
 	Loads all animations from the "Animations" folder inside the script into the Animator
 	Supports both individual animation instances and nested animation folders
+	Loads everything upfront at Init instead of on demand avoiding a delay
+	the first time each animation actually plays
 ]]
 function CharacterController:InitAnimations(): ()
 	local animationFolder = script:FindFirstChild("Animations")
@@ -120,13 +136,29 @@ function CharacterController:InitAnimations(): ()
 	end
 end
 
+--[[
+	Names and stores each connection in a table so :Destroy() can disconnect
+	all of them generically without hardcoding each one
+]]
 function CharacterController:InitConnections(): ()
+	-- Stops animations on death for cleanup
 	self.connections["Died"] = self.humanoid.Died:Connect(function()
 		self:StopAllAnimations()
 	end)
+
+	--[[
+		Listens broadly to attribute changes so UpdateState reacts consistently
+		regardless of whether an attribute is set by the server or written locally
+		by this same controller
+	]]
 	self.connections["AttributeChanged"] = self.character.AttributeChanged:Connect(function(attribute: string)
 		self:UpdateState()
 	end)
+
+	--[[
+		Re-checks state whenever a child is added or removed since markers
+		like "Attacking" or "Ragdoll" are represented as a child Instance
+	]]
 	self.connections["ChildAdded"] = self.character.ChildAdded:Connect(function(child: Instance)
 		self:UpdateState()
 	end)
@@ -151,6 +183,11 @@ function CharacterController:InitConnections(): ()
 			end
 		end
 	end)
+
+	--[[
+		gameProcessedEvent is skipped on InputEnded so an already active key
+		always gets cleared even if the release is consumed by a GUI
+	]]
 	self.connections["InputBegan"] = userInputService.InputBegan:Connect(function(input: InputObject, gameProcessedEvent: boolean)
 		if gameProcessedEvent then return end
 
@@ -159,11 +196,20 @@ function CharacterController:InitConnections(): ()
 	self.connections["InputEnded"] = userInputService.InputEnded:Connect(function(input: InputObject, gameProcessedEvent: boolean)
 		self:KeyUsed(input, false)
 	end)
+
+	--[[
+		Uses RenderStepped so animation and running state updates run right
+		before each frame is rendered
+	]]
 	self.connections["RenderStepped"] = runService.RenderStepped:Connect(function(delta: number)
 		self:Update(delta)
 	end)
 end
 
+--[[
+	Guards against a nil character or humanoid and skips further work once dead
+	since Died already handles animation teardown
+]]
 function CharacterController:Update(delta: number): ()
 	if not self.character or not self.humanoid or self.humanoid.Health <= 0 then return end
 	
@@ -171,7 +217,7 @@ function CharacterController:Update(delta: number): ()
 	self:UpdateRunning()
 end
 
--- Converts the key input into a game action using the defaultKeybinds dictionary mapping
+-- Translates input into named actions so keybinds can change later without touching the rest of the code
 function CharacterController:KeyUsed(input: InputObject, isDown: boolean): ()
 	local key: string? = nil
 	local inputName: string? = nil
@@ -184,6 +230,10 @@ function CharacterController:KeyUsed(input: InputObject, isDown: boolean): ()
 	
 	if not inputName then return end
 	
+	--[[
+		Scans defaultKeybinds directly instead of keeping a precomputed inverse table
+		since the table is tiny and this only runs per key event not per frame
+	]]
 	for name, keybind in pairs(self.defaultKeybinds) do
 		if keybind == inputName then
 			key = name
@@ -200,7 +250,7 @@ function CharacterController:KeyUsed(input: InputObject, isDown: boolean): ()
 	
 	--[[
 		Dash is handled client-side to provide immediate visual feedback and zero input lag
-		preventing movement delay under hight ping conditions
+		preventing movement delay under high ping conditions
 		The remaining actions are replicated to the server for validation and execution
 	]]
 	if key == "Dash" then
@@ -220,6 +270,10 @@ end
 	based on the humanoid state and character state attributes
 ]]
 function CharacterController:UpdateAnimationState(): ()
+	--[[
+		Blocking is diffed separately since it layers on the "overlay" slot
+		rather than replacing whatever the "main" slot is doing
+	]]
 	local blocking: boolean = self.character:GetAttribute("Blocking")
 	if blocking ~= self.blocking then
 		self.blocking = blocking
@@ -235,6 +289,10 @@ function CharacterController:UpdateAnimationState(): ()
 	local speed: number = self.humanoid.MoveDirection.Magnitude
 	local state: string = "Idle"
 	
+	--[[
+		Checks running before airborne states so jumping while sprinting keeps
+		the run animation instead of switching to jump or fall
+	]]
 	if self.character:GetAttribute("Running") then
 		state = "Run"
 	elseif humanoidState == Enum.HumanoidStateType.Freefall then
@@ -245,6 +303,7 @@ function CharacterController:UpdateAnimationState(): ()
 		state = "Walk"
 	end
 	
+	-- Diffed here too to skip call entirely on frames where nothing changed
 	if state ~= self.state then
 		self.state = state
 		self:PlayAnimation("main", state, 0.2, nil)
@@ -267,11 +326,15 @@ function CharacterController:UpdateRunning(): ()
 		
 		--[[
 			forwardDot >= -0.1 ensures the character is moving forward
-			and rightDot < 0.85 prevents running if the direction leans too far sideways
+			and math.abs(rightDot) < 0.85 prevents running if the direction leans too far sideways
 		]]
 		canRun = self.humanoid.MoveDirection.Magnitude > 0.1 and forwardDot >= -0.1 and math.abs(rightDot) < 0.85
 	end
 	
+	--[[
+		Only write the attribute when it actually changes to avoid
+		retriggering AttributeChanged and UpdateState every frame
+	]]
 	if canRun ~= running then
 		self.character:SetAttribute("Running", canRun)
 		self:UpdateState()
@@ -289,7 +352,10 @@ function CharacterController:UpdateState(): ()
 	local attacking = self.character:FindFirstChild("Attacking")
 	local ragdoll = self.character:FindFirstChild("Ragdoll")
 	
-	-- Prevents the character from running while actively engaged in another restricted action
+	--[[
+		Prevents the character from running while actively engaged in another restricted action
+		Also forces the attribute itself so other systems reading it stay in sync
+	]]
 	if blocking or attacking or ragdoll then
 		running = false
 		self.character:SetAttribute("Running", false)
@@ -317,6 +383,11 @@ function CharacterController:PlayAnimation(slot: "main" | "overlay", name: strin
 	end
 	
 	if not track then return end
+
+	--[[
+		Skips restarting a track that's already playing on this slot
+		which would otherwise cause a visible stutter
+	]]
 	if track == currentTrack then return end
 	
 	if currentTrack then
@@ -333,6 +404,7 @@ function CharacterController:PlayAnimation(slot: "main" | "overlay", name: strin
 	return track
 end
 
+-- Mirrors PlayAnimation's slot indirection for a matching Stop operation
 function CharacterController:StopAnimation(slot: "main" | "overlay", fadeTime: number): ()
 	local fade = fadeTime or 0.2
 	local currentTrack: AnimationTrack = if slot == "main" then self.track else self.overlayTrack
@@ -361,7 +433,11 @@ end
 function CharacterController:Dash(): ()
 	if self.character:FindFirstChild("Attacking") or self.character:GetAttribute("Blocking") or self.character:FindFirstChild("Ragdoll") then return end
 	
-	-- Clean up any lingering dash connections from previous dash to prevent memory leaks
+	--[[
+		Clean up any lingering dash connections from previous dash to prevent memory leaks
+		Disconnects any leftover dash connections first since a re-triggered dash
+		could otherwise leave duplicate connections running side by side
+	]]
 	if self.connections["DashRenderStepped"] then
 		self.connections["DashRenderStepped"]:Disconnect()
 		self.connections["DashRenderStepped"] = nil :: any
@@ -377,6 +453,11 @@ function CharacterController:Dash(): ()
 	
 	local linearVelocity: LinearVelocity? = nil
 	
+
+	--[[
+		Read from activeKeys to avoid a frame of input lag
+		when determining the intended dash direction
+	]]
 	local direction: string? = nil
 	if self.activeKeys["Forward"] then
 		direction = "Forward"
@@ -391,6 +472,11 @@ function CharacterController:Dash(): ()
 	if not direction then return end
 	
 	local now = os.clock()
+
+	--[[
+		Forward and backward dashes cover more effective distance so they get a 
+		longer cooldown, side dashes stay short to keep strafing viable
+	]]
 	if direction == "Forward" or direction == "Backward" then
 		if now - self.lastDash < 5 then return end
 		self.lastDash = now
@@ -420,27 +506,37 @@ function CharacterController:Dash(): ()
 		linearVelocity = Instance.new("LinearVelocity")
 		if linearVelocity then
 			linearVelocity.Attachment0 = humanoidRootPart:WaitForChild("RootAttachment") :: Attachment
+
+			-- Y-axis force is zeroed so dash can't launch the character vertically
 			linearVelocity.ForceLimitMode = Enum.ForceLimitMode.PerAxis
 			linearVelocity.MaxAxesForce = Vector3.new(1, 0, 1) * 50000
+
+			--[[
+				RelativeTo Attachment0 makes VectorVelocity local-space so the same
+				four vectors work regardless of the character's facing
+			]]
 			linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.Attachment0
 			linearVelocity.Parent = humanoidRootPart
 			
 			if direction == "Forward" then
-				linearVelocity.VectorVelocity = Vector3.new(0, 0, -100)
+				linearVelocity.VectorVelocity = Vector3.new(0, 0, -200)
 			elseif direction == "Backward" then
-				linearVelocity.VectorVelocity = Vector3.new(0, 0, 100)
+				linearVelocity.VectorVelocity = Vector3.new(0, 0, 200)
 			elseif direction == "Left" then
-				linearVelocity.VectorVelocity = Vector3.new(-100, 0, 0)
+				linearVelocity.VectorVelocity = Vector3.new(-200, 0, 0)
 			elseif direction == "Right" then
-				linearVelocity.VectorVelocity = Vector3.new(100, 0, 0)
+				linearVelocity.VectorVelocity = Vector3.new(200, 0, 0)
 			end
 			
 			-- Gradually decay dash velocity for natural physics dampening rather than abrupt stop
-			tweenService:Create(linearVelocity, TweenInfo.new(0.5, Enum.EasingStyle.Linear, Enum.EasingDirection.Out), { VectorVelocity = Vector3.zero }):Play()
+			tweenService:Create(linearVelocity, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { VectorVelocity = Vector3.zero }):Play()
 		end
 	end)
 	
-	-- Clean up temporary physical instances and events listeners upon animation completion
+	--[[
+		Clean up temporary physical instances and events listeners upon animation completion
+		tied to track.Stopped so it fires correctly whether the dash finishes naturally or is interrupted early
+	]]
 	track.Stopped:Once(function()
 		if linearVelocity then
 			linearVelocity:Destroy()
@@ -471,6 +567,10 @@ function CharacterController:Destroy(): ()
 		end
 	end
 	
+	--[[
+		Clears tables with table.clear instead of reassignment so any lingering reference sees the tables emptied too
+		and metatable is cleared last so no method can fire mid-teardown
+	]]
 	table.clear(self.connections)
 	table.clear(self.activeKeys)
 	table.clear(self.defaultKeybinds)
@@ -481,6 +581,10 @@ end
 
 local characterController: CharacterController? = nil
 
+--[[
+	Destroys any previous controller first since CharacterAdded fires
+	again on respawn while the old controller's connections are still alive
+]]
 local function characterAdded(character: Model): ()
 	if characterController then
 		characterController:Destroy()
@@ -493,6 +597,10 @@ local function characterAdded(character: Model): ()
 	end
 end
 
+--[[
+	Clones map lighting so the originals stay intact under
+	workspace.Game.Map.Lighting for reuse if the map resets
+]]
 local function initLighting(): ()
 	local gameFolder = workspace:FindFirstChild("Game")
 	if gameFolder then
@@ -506,6 +614,10 @@ initLighting()
 
 if player then
 	player.CharacterAdded:Connect(characterAdded)
+	--[[
+		Covers the case where this script runs after the character already
+		exists since CharacterAdded only fires for future spawns
+	]]
 	if player.Character then
 		characterAdded(player.Character)
 	end
